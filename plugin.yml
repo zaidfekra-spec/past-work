@@ -1,0 +1,45 @@
+# KillTrackerPlugin plugin.yml
+name: KillTrackerPlugin
+main: com.example.killtracker.KillTrackerPlugin
+version: 1.0.0
+api-version: 1.19
+commands:
+  kills:
+    description: Show kill stats and controls
+    usage: /kills [top|reset|save]
+permissions:
+  killtracker.admin:
+    default: op
+
+# WelcomeMessagePlugin plugin.yml
+name: WelcomeMessagePlugin
+main: com.example.welcome.WelcomeMessagePlugin
+version: 1.0.0
+api-version: 1.19
+commands:
+  welcome:
+    description: Manage welcome settings
+    usage: /welcome reload|set <path> <value>|worlds
+permissions:
+  welcome.admin:
+    default: op
+
+# DatabaseExamplePlugin plugin.yml
+name: DatabaseExamplePlugin
+main: com.example.database.DatabaseExamplePlugin
+version: 1.0.0
+api-version: 1.19
+commands:
+  db:
+    description: Database demo
+    usage: /db set|get|synconline
+
+# NMSExamplePlugin plugin.yml
+name: NMSExamplePlugin
+main: com.example.nms.NMSExamplePlugin
+version: 1.0.0
+api-version: 1.19
+commands:
+  nmsarmorstand:
+    description: Spawn a virtual armor stand via NMS
+    usage: /nmsarmorstand <name> [glow] [invisible] | clear
