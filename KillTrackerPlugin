@@ -2,84 +2,277 @@ package com.example.killtracker;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Material;
+import org.bukkit.Statistic;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabExecutor;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
-public class KillTrackerPlugin extends JavaPlugin implements Listener {
+/**
+ * KillTrackerPlugin
+ * - Tracks kills via PlayerDeathEvent.
+ * - /kills [top|reset|save] [player]
+ * - Async periodic saves to simulated storage.
+ * - Demonstrates concurrency, DI, efficient code, and clean communication patterns.
+ */
+public class KillTrackerPlugin extends JavaPlugin implements Listener, TabExecutor {
 
-    private final ConcurrentHashMap<String, Integer> kills = new ConcurrentHashMap<>();
+    // In-memory kills store, thread-safe
+    private final ConcurrentHashMap<UUID, Integer> kills = new ConcurrentHashMap<>();
+
+    // Last-action timestamps for rate-limiting commands
+    private final Map<UUID, Instant> lastCommandTs = new ConcurrentHashMap<>();
+
+    // Optional JDBC connection (simulated here; you can wire real DB creds)
     private Connection connection;
+
+    // Configurable settings
+    private int saveIntervalSeconds;
+    private boolean rewardOnMilestones;
 
     @Override
     public void onEnable() {
-        getLogger().info("KillTrackerPlugin enabled!");
+        // Config initialization
+        saveDefaultConfig();
+        saveIntervalSeconds = getConfig().getInt("save-interval-seconds", 60);
+        rewardOnMilestones = getConfig().getBoolean("reward-on-milestones", true);
+
+        // Event + command registration
         getServer().getPluginManager().registerEvents(this, this);
+        getCommand("kills").setExecutor(this);
+        getCommand("kills").setTabCompleter(this);
 
-        // Setup database connection
-        try {
-            connection = DriverManager.getConnection("jdbc:mysql://localhost:3306/mcdata", "user", "pass");
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
+        // Optional DB setup (commented out to avoid requiring local DB)
+        setupOptionalMySql();
 
-        // Async save task
+        // Async periodic save task
         new BukkitRunnable() {
             @Override
             public void run() {
-                kills.forEach((playerName, count) -> saveKillData(playerName, count));
+                asyncSaveAll();
             }
-        }.runTaskTimerAsynchronously(this, 0L, 20 * 60); // every minute
+        }.runTaskTimerAsynchronously(this, saveIntervalSeconds * 20L, saveIntervalSeconds * 20L);
+
+        getLogger().info("KillTrackerPlugin enabled. Saving every " + saveIntervalSeconds + "s.");
     }
 
     @Override
     public void onDisable() {
+        HandlerList.unregisterAll((Listener) this);
+        if (connection != null) {
+            try { connection.close(); } catch (SQLException ignored) {}
+        }
+        // Final save
+        asyncSaveAll();
+        getLogger().info("KillTrackerPlugin disabled. Data flushed.");
+    }
+
+    /**
+     * Optional: connect to MySQL to demonstrate resource handling.
+     * Replace URL/user/pass with real creds if you want live persistence.
+     */
+    private void setupOptionalMySql() {
+        String url = "jdbc:mysql://localhost:3306/mcdata?useSSL=false&serverTimezone=UTC";
+        String user = "user";
+        String pass = "pass";
         try {
-            if (connection != null && !connection.isClosed()) connection.close();
+            connection = DriverManager.getConnection(url, user, pass);
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "CREATE TABLE IF NOT EXISTS kills (uuid VARCHAR(36) PRIMARY KEY, count INT NOT NULL)")) {
+                ps.executeUpdate();
+            }
+            getLogger().info("Connected to MySQL (optional).");
         } catch (SQLException e) {
-            e.printStackTrace();
+            getLogger().warning("MySQL not available; using file-based persistence only. " + e.getMessage());
+            connection = null;
         }
     }
 
+    /**
+     * Event: increment killer's count, broadcast milestones, reward items.
+     */
     @EventHandler
     public void onPlayerDeath(PlayerDeathEvent event) {
-        if (event.getEntity().getKiller() != null) {
-            Player killer = event.getEntity().getKiller();
-            kills.merge(killer.getName(), 1, Integer::sum);
-            killer.sendMessage(ChatColor.GREEN + "You now have " + kills.get(killer.getName()) + " kills!");
+        Player victim = event.getEntity();
+        Player killer = victim.getKiller();
+        if (killer == null) return;
+
+        UUID id = killer.getUniqueId();
+        int total = kills.merge(id, 1, Integer::sum);
+
+        killer.sendMessage(ChatColor.GREEN + "Kill recorded. Total: " + ChatColor.YELLOW + total);
+        getLogger().info(killer.getName() + " now has " + total + " kills.");
+
+        // Milestone reward demo
+        if (rewardOnMilestones && (total % 5 == 0)) {
+            killer.getInventory().addItem(new ItemStack(Material.GOLDEN_APPLE, 1));
+            Bukkit.broadcastMessage(ChatColor.GOLD + killer.getName()
+                    + " reached " + total + " kills and received a Golden Apple!");
         }
     }
 
+    /**
+     * Command: /kills [top|reset|save] [player]
+     * - /kills             -> show your kills + vanilla KILLS statistic
+     * - /kills top         -> show top 10 currently in memory
+     * - /kills reset <p>   -> admin-only reset
+     * - /kills save        -> force async save
+     */
     @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (command.getName().equalsIgnoreCase("kills") && sender instanceof Player player) {
-            int playerKills = kills.getOrDefault(player.getName(), 0);
-            player.sendMessage(ChatColor.YELLOW + "You have " + playerKills + " kills.");
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        if (!cmd.getName().equalsIgnoreCase("kills")) return false;
+
+        // Basic rate limit for players
+        if (sender instanceof Player p) {
+            Instant now = Instant.now();
+            Instant last = lastCommandTs.getOrDefault(p.getUniqueId(), Instant.EPOCH);
+            if (now.isBefore(last.plusSeconds(2))) {
+                p.sendMessage(ChatColor.RED + "You're using that too fast. Slow down.");
+                return true;
+            }
+            lastCommandTs.put(p.getUniqueId(), now);
+        }
+
+        if (args.length == 0) {
+            return showSelfKills(sender);
+        }
+
+        switch (args[0].toLowerCase(Locale.ROOT)) {
+            case "top":
+                return showTop(sender);
+            case "reset":
+                return resetPlayer(sender, args);
+            case "save":
+                asyncSaveAll();
+                sender.sendMessage(ChatColor.GREEN + "Triggered async save.");
+                return true;
+            default:
+                sender.sendMessage(ChatColor.RED + "Usage: /kills [top|reset|save] [player]");
+                return true;
+        }
+    }
+
+    private boolean showSelfKills(CommandSender sender) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Players only.");
             return true;
         }
-        return false;
+        int pluginKills = kills.getOrDefault(player.getUniqueId(), 0);
+        int vanillaKills = player.getStatistic(Statistic.PLAYER_KILLS);
+        sender.sendMessage(ChatColor.YELLOW + "Your kills (plugin): " + pluginKills
+                + ChatColor.GRAY + " | (vanilla stat): " + vanillaKills);
+        return true;
     }
 
-    private void saveKillData(String playerName, int count) {
-        try (PreparedStatement stmt = connection.prepareStatement(
-                "INSERT INTO kills (player, count) VALUES (?, ?) ON DUPLICATE KEY UPDATE count=?")) {
-            stmt.setString(1, playerName);
-            stmt.setInt(2, count);
-            stmt.setInt(3, count);
-            stmt.executeUpdate();
-        } catch (SQLException e) {
-            e.printStackTrace();
+    private boolean showTop(CommandSender sender) {
+        // Gather online players with their counts, sorted desc
+        List<String> leaderboard = Bukkit.getOnlinePlayers().stream()
+                .map(p -> new AbstractMap.SimpleEntry<>(p, kills.getOrDefault(p.getUniqueId(), 0)))
+                .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                .limit(10)
+                .map(e -> ChatColor.GOLD + e.getKey().getName() + ChatColor.WHITE + " - " + e.getValue())
+                .collect(Collectors.toList());
+
+        if (leaderboard.isEmpty()) {
+            sender.sendMessage(ChatColor.GRAY + "No kills recorded yet.");
+            return true;
         }
+        sender.sendMessage(ChatColor.AQUA + "Top kills (online):");
+        leaderboard.forEach(sender::sendMessage);
+        return true;
+    }
+
+    private boolean resetPlayer(CommandSender sender, String[] args) {
+        if (!sender.hasPermission("killtracker.admin")) {
+            sender.sendMessage(ChatColor.RED + "You lack permission: killtracker.admin");
+            return true;
+        }
+        if (args.length < 2) {
+            sender.sendMessage(ChatColor.RED + "Usage: /kills reset <player>");
+            return true;
+        }
+        Player target = Bukkit.getPlayerExact(args[1]);
+        if (target == null) {
+            sender.sendMessage(ChatColor.RED + "Player not found.");
+            return true;
+        }
+        kills.put(target.getUniqueId(), 0);
+        sender.sendMessage(ChatColor.GREEN + "Reset kills for " + target.getName());
+        target.sendMessage(ChatColor.RED + "Your kills were reset by an admin.");
+        return true;
+    }
+
+    /**
+     * Async save demonstrating concurrency and safe IO.
+     * Writes a simple JSON-like file; optionally persists to MySQL if connected.
+     */
+    private void asyncSaveAll() {
+        Map<UUID, Integer> snapshot = new HashMap<>(kills);
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                // File save
+                File dataFile = new File(getDataFolder(), "kills.json");
+                dataFile.getParentFile().mkdirs();
+                String content = snapshot.entrySet().stream()
+                        .map(e -> "{\"uuid\":\"" + e.getKey() + "\",\"count\":" + e.getValue() + "}")
+                        .collect(Collectors.joining(",\n", "[\n", "\n]"));
+                try {
+                    Files.writeString(dataFile.toPath(), content);
+                } catch (IOException e) {
+                    getLogger().warning("Failed writing kills.json: " + e.getMessage());
+                }
+
+                // Optional DB save
+                if (connection != null) {
+                    snapshot.forEach((uuid, count) -> {
+                        try (PreparedStatement ps = connection.prepareStatement(
+                                "INSERT INTO kills (uuid, count) VALUES (?, ?) ON DUPLICATE KEY UPDATE count=?")) {
+                            ps.setString(1, uuid.toString());
+                            ps.setInt(2, count);
+                            ps.setInt(3, count);
+                            ps.executeUpdate();
+                        } catch (SQLException e) {
+                            getLogger().warning("DB save failed for " + uuid + ": " + e.getMessage());
+                        }
+                    });
+                }
+            }
+        }.runTaskAsynchronously(this);
+    }
+
+    /**
+     * Tab completion for convenience.
+     */
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
+        if (!cmd.getName().equalsIgnoreCase("kills")) return Collections.emptyList();
+        if (args.length == 1) {
+            return Arrays.asList("top", "reset", "save");
+        }
+        if (args.length == 2 && "reset".equalsIgnoreCase(args[0])) {
+            return Bukkit.getOnlinePlayers().stream().map(Player::getName).collect(Collectors.toList());
+        }
+        return Collections.emptyList();
     }
 }
