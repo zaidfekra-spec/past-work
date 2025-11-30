@@ -1,0 +1,85 @@
+package com.example.killtracker;
+
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class KillTrackerPlugin extends JavaPlugin implements Listener {
+
+    private final ConcurrentHashMap<String, Integer> kills = new ConcurrentHashMap<>();
+    private Connection connection;
+
+    @Override
+    public void onEnable() {
+        getLogger().info("KillTrackerPlugin enabled!");
+        getServer().getPluginManager().registerEvents(this, this);
+
+        // Setup database connection
+        try {
+            connection = DriverManager.getConnection("jdbc:mysql://localhost:3306/mcdata", "user", "pass");
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+
+        // Async save task
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                kills.forEach((playerName, count) -> saveKillData(playerName, count));
+            }
+        }.runTaskTimerAsynchronously(this, 0L, 20 * 60); // every minute
+    }
+
+    @Override
+    public void onDisable() {
+        try {
+            if (connection != null && !connection.isClosed()) connection.close();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        if (event.getEntity().getKiller() != null) {
+            Player killer = event.getEntity().getKiller();
+            kills.merge(killer.getName(), 1, Integer::sum);
+            killer.sendMessage(ChatColor.GREEN + "You now have " + kills.get(killer.getName()) + " kills!");
+        }
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (command.getName().equalsIgnoreCase("kills") && sender instanceof Player player) {
+            int playerKills = kills.getOrDefault(player.getName(), 0);
+            player.sendMessage(ChatColor.YELLOW + "You have " + playerKills + " kills.");
+            return true;
+        }
+        return false;
+    }
+
+    private void saveKillData(String playerName, int count) {
+        try (PreparedStatement stmt = connection.prepareStatement(
+                "INSERT INTO kills (player, count) VALUES (?, ?) ON DUPLICATE KEY UPDATE count=?")) {
+            stmt.setString(1, playerName);
+            stmt.setInt(2, count);
+            stmt.setInt(3, count);
+            stmt.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+}
